@@ -12,7 +12,7 @@
 
 #define THREADS_PER_BLOCK 256
 #define THREADS_PER_BLOCK_SAMPLING 8
-#define POINTS_PER_BIN   1024
+#define CALLS_PER_BOX   1024
 //( THREADS_PER_BLOCK * THREADS_PER_BLOCK )
 
 using namespace std;
@@ -24,8 +24,8 @@ float func( const float * x )
   //return x[0]*x[0];
 
   //return x[0]*x[0] + x[1]*x[1]; //0.666667
-  //return sin( x[0] ) * cos( x[1] ); // 0.386822
-  return x[0]*x[0] + sin(x[1]); // 0.793031
+  return sin( x[0] ) * cos( x[1] ); // 0.386822
+  // return x[0]*x[0] + sin(x[1]); // 0.793031
   //return x[0]*x[0] + x[1]*x[1] + 2*x[2]*x[2]; //1.33333
 }
 
@@ -56,12 +56,15 @@ __host__ __device__
 void DumpEdges( const float * x, const int NBINS, const int NDIM )
 {
   printf( "DEBUG: %i bin edges in %i dimensions:\n", NBINS, NDIM );  
+  printf( "<<\n" );
   for( unsigned int d = 0 ; d < NDIM ; ++d ) {
+    printf( "[" );
     for( unsigned int b = 0 ; b <= NBINS ; ++b ) {
       printf( " %f", x[d*(NBINS+1)+b] );
     }
-    printf( "\n" );
+    printf( " ]\n" );
   }
+  printf( ">>\n" );
 }
 
 void DumpBinVolumes( const float * binVol, const int NBINS, const int NDIM )
@@ -78,168 +81,122 @@ void DumpBinVolumes( const float * binVol, const int NBINS, const int NDIM )
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
-__device__ __host__
-void Refine( float * x_new, const float * x_old, const int * split_map, 
-	     const int NBINS_OLD, const int NBINS_NEW, const int idim )
+__global__
+void RefineGPU( float * x, const float * f, const float * binVolumes, const float totVolume, const float alpha, const int NBINS )
 {
-  int pos = 0;
-  int offset = idim * ( NBINS_OLD + 1 );
-  for( int i = 0 ; i < NBINS_OLD ; ++i ) {
-    int Nsplit = (int)split_map[i];
+  // http://root.cern.ch/root/html/src/RooGrid.cxx.html#LazfmD
 
-    if( Nsplit < 2 ) {
-      x_new[pos] = x_old[offset+i];
-      //printf("%i : %f\n", pos, x_new[pos] );
-      pos++;
+  // smooth this dimension's histogram of grid values and calculate the
+  // new sum of the histogram contents as grid_tot_j
+
+  const unsigned int idim = blockIdx.x;
+
+  const unsigned int offset = idim * ( NBINS );
+  const unsigned int xoffset = idim * ( NBINS + 1 );
+
+  float * wf = new float[NBINS];
+  for( unsigned int i = 0 ; i < NBINS ; ++i ) {
+    const int j = offset + i;
+
+    wf[i] = binVolumes[j] * f[j] / totVolume / CALLS_PER_BOX;
+  }
+
+  float oldg = wf[0];
+  float newg = wf[1];
+  wf[0] = 0.5 * ( oldg + newg );
+  float grid_tot_j = wf[0];
+
+  // this loop implements value(i,j) = ( value(i-1,j)+value(i,j)+value(i+1,j) ) / 3
+  unsigned int i = 0;
+  for( i = 1 ; i < (NBINS-1) ; ++i ) {
+    float rc = oldg + newg;
+    oldg = newg;
+    newg = wf[i+1];
+    wf[i] = ( rc + newg ) / 3.;
+    grid_tot_j += wf[i];
+  }
+  wf[NBINS-1] = 0.5 * ( newg + oldg );
+  grid_tot_j += f[NBINS-1];
+
+  // calculate the weights for each bin of this dimension's histogram of values and their sum
+  float * weights = new float[NBINS];
+  float tot_weight = 0.;
+  for( i = 0 ; i < NBINS ; ++i ) {
+    weights[i] = 0.;
+    if( wf[i] > 0. ) {
+      oldg = grid_tot_j / wf[i];
+      weights[i] = powf( ( (oldg-1.0)/oldg/log(oldg)), alpha );
     }
-    else {
-      const int Nbins = split_map[i];
-      //printf("rebin (%i) -> %i\n", i, Nbins );
+    tot_weight += weights[i];
+  }
 
-      const float deltax = x_old[offset+i+1] - x_old[offset+i];
-      const float bw     = deltax / (float)Nbins;
+  float pts_per_bin = tot_weight / NBINS;
 
-      for( int p = 0 ; p < Nbins; ++p ) {
-	x_new[pos] = x_old[offset+i] + p*bw;
-	//printf("%i : %f\n", pos, x_new[pos] );
-	pos++;
-      }    
+  float xold = 0.;
+  float xnew = 0.;
+  float dw   = 0.;
+  float * x_new = new float[NBINS];
+
+  unsigned int k = 0;
+  i = 1;
+  for( k = 0 ; k < NBINS ; ++k ) {
+    dw += weights[k];
+    xold = xnew;
+    xnew = x[xoffset+k+1];
+
+    while( dw > pts_per_bin ) { 
+      dw -= pts_per_bin;
+      x_new[i++] = xnew - (xnew - xold) * dw / weights[k];
     }
   }
-  x_new[NBINS_NEW] = x_old[offset+NBINS_OLD];
-  
-  /*
-  for( int i = 0 ; i < NBINS_NEW ; ++i ) {
-    float deltax = x_new[i+1] - x_new[i];
-    printf( "  %2i) [ %f, %f ] = [ %f ] \n", i, x_new[i], x_new[i+1], deltax  );
+
+  for( k = 1 ; k < NBINS ; ++k ) {
+    x[xoffset+k] = x_new[k];
   }
-  */
-  //printf("DEBUG: Refine done.\n" );
+
+  //x[xoffset+NBINS] = 1.0;
+
+  delete [] wf;
+  delete [] weights;
+  delete [] x_new;
 }
 
+/////////////////////////////////////////////
 
-//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-
+/*
 __device__ __host__
-void Resize( float * x, const float * x_tmp, const float * h, const float tot_weight,
-	     const int NBINS, const int NBINS_NEW, const int NDIM )
+void ResizeGPU( float * xtarget, float * x_source,
+		const unsigned int nbins_target, const unsigned int nbins_source, 
+		const unsigned int idim )
 {
-  float pts_per_bin = (float)NBINS_NEW / (float)NBINS;
+  if( nbins_target == nbins_source ) return;
 
-  x[0] = x_tmp[0]; // left end
+  const unsigned int xoffset = idim * ( NBINS + 1 );
 
-  float xold = x_tmp[0];
-  float xnew = x_tmp[0];
+  float pts_per_bin = (float)nbins_target / (float)nbins_source;
+  
+  float xold = 0.;
+  float xnew = 0.;
   float dw   = 0.;
-  int   j    = 1;
-
-  for( int k = 0 ; k <= ( NBINS_NEW ) ; ++k ) {
-    dw = dw + 1; //h[k];
+  unsigned int i = 0;
+  unsigned int k = 0;
+  for( k = 1 ; k <= nbins_source ; ++k ) {
+    dw += 1.0;
     xold = xnew;
-    xnew = x_tmp[k+1];
-
     while( dw > pts_per_bin ) {
       dw -= pts_per_bin;
-      x[j] = xnew - ( xnew - xold ) * dw;// / h[k];
-      j += 1;
+      x_source[i++] = xnew - (xnew - xold) * dw;
     }
   }
-  x[NBINS] = x_tmp[NBINS_NEW]; // right end
-  
-  /*
-  for( int i = 0 ; i < NBINS ; ++i ) {
-    const float deltax = x[i+1] - x[i];
-    printf( "  %2i) [ %f, %f ] = [ %f ]\n", i, x[i], x[i+1], deltax );
+
+  // copy new edges
+  for(k = 1 ; k < nbins_target ; k++) {
+    x[xoffset+k] = x_source[xoffset+k];
   }
-  */
-  //printf("DEBUG: Resize done.\n" );
 }
-
-
-//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-
-void RebinCPU( float * x, const float * f_abs, const int NBINS, const int NDIM )
-{
-
-  // const float xrange = x[NBINS] - x[0];
-  float tot_weight = 0.;
-  for( int i = 0 ; i < NBINS ; ++i ) {
-    const float deltax = x[i+1] - x[i];
-    //const float w = deltax / xrange;
-    tot_weight += deltax * f_abs[i];
-  }
-
-  int NBINS_NEW = 0;
-  int * split_map;
-  cudaMallocManaged( &split_map, NBINS*sizeof(int) );
-
-  for( int i = 0 ; i < NBINS ; ++i ) {
-    split_map[i]  = 1 + floor( f_abs[i] / tot_weight + 0.5 );
-    NBINS_NEW += split_map[i];
-  }
-  printf( "DEBUG: nbins new = %i\n", NBINS_NEW );
-
-  float * x_tmp; //= new float[NBINS_NEW+1];
-  cudaMallocManaged( &x_tmp, (NBINS+1) * sizeof(float) );
-
-  Refine( x_tmp, x, split_map, NBINS, NBINS_NEW, NDIM );
-
-  // check convergence here
-
-  Resize( x, x_tmp, f_abs, tot_weight, NBINS, NBINS_NEW, NDIM );
-  
-  cudaFree( split_map );  
-  cudaFree( x_tmp );
-  
-  printf("DEBUG: Rebin done\n" );
-}
-
+*/
 
 /////////////////////////////////////////////
-
-
-__global__
-void RebinGPU( float * x, 
-	       const float * f_abs,
-	       const float * binVol, const float totVol, 
-	       const unsigned int NBINS, const unsigned int NDIM, const unsigned int NBINS_TOT )
-{
-  const int idim = blockIdx.x;
-  if( idim > NDIM ) return;
-
-  float tot_weight  = 0.;
-  for( int i = 0 ; i < NBINS ; ++i ) {
-    const unsigned int j = idim*(NBINS+1) + i;
-    const float deltax = x[j+1] - x[j];
-    tot_weight += deltax * f_abs[i];
-  }
- 
-
-  int NBINS_NEW = 0;
-  int   * split_map = new int[NBINS];
-  float * x_tmp     = new float[NBINS_NEW];
-  
-  for( int i = 0 ; i < NBINS ; ++i ) {
-    split_map[i]  = 1 + floor( f_abs[i] / tot_weight  + 0.5 );
-    NBINS_NEW += split_map[i];
-    // printf( "bin %i -> %i\n", i, split_map[i] );
-  }
-  // printf( "DEBUG: refined bins: %i\n", NBINS_NEW );
-
-  Refine( x_tmp, x, split_map, NBINS, NBINS_NEW, idim );
-  //DumpEdges( x_tmp, NBINS_NEW, NDIM );
-
-  Resize( x, x_tmp, f_abs, tot_weight, NBINS, NBINS_NEW, idim );
-
-  delete [] split_map;
-  delete [] x_tmp;
-}
-
-
-/////////////////////////////////////////////
-
 
 
 __global__
@@ -272,13 +229,13 @@ void DumpBinWidths( const float * bw, const int NBINS, const int NDIM )
 
 
 __global__ 
-void CalcBinVolume( float * binVol, const float * bw, const int NBINS, const int NDIM, const int NBINS_TOT )
+void CalcBinVolume( float * binVol, const float * bw, const int NBINS, const int NDIM, const int NBOXES )
 {
   //const unsigned int ibin  = threadIdx.x; 
   const unsigned int ibin  = blockIdx.x;
 
   //if( idim > NDIM ) return;
-  if( ibin > NBINS_TOT ) return;
+  if( ibin > NBOXES ) return;
 
   float bv = 1.;
 
@@ -305,7 +262,7 @@ void DoSampling(
 		  float * sum_f, float * sum_f_sq, float * sum_f_abs,
 		  curandState * state,
 		  const float * x, const float * bw,
-		  const int NBINS, const int NDIM, const int NBINS_TOT 
+		  const int NBINS, const int NDIM, const int NBOXES 
 		 )
 {
   /*
@@ -325,7 +282,7 @@ void DoSampling(
   unsigned int I     = iglob*blockDim.x + tid;
   
   if( ibin > NBINS ) return;
-  if( iglob >= NBINS_TOT ) return;
+  if( iglob >= NBOXES ) return;
   if( idim > NDIM ) return;
 
   curandState localState = state[I];
@@ -338,7 +295,7 @@ void DoSampling(
 
   // for each sampling (k) evaluate f() at a certain d-dimensional point x0
 
-  const unsigned int NSAMPLINGS = POINTS_PER_BIN/THREADS_PER_BLOCK_SAMPLING ;
+  const unsigned int NSAMPLINGS = CALLS_PER_BOX/THREADS_PER_BLOCK_SAMPLING ;
   for( unsigned int k = 0 ; k < NSAMPLINGS ; ++k ) {
 
     int ig = iglob;
@@ -427,17 +384,17 @@ __global__
 void Finalize( float * sum_f, 
 	       const float * d_f, 
 	       const float * binVol, const float totVol,
-	       const unsigned int NBINS_TOT )
+	       const unsigned int NBOXES )
 {
   extern __shared__ float s_f[];
 
   unsigned int tid = threadIdx.x;
   unsigned int   i = blockIdx.x*blockDim.x + threadIdx.x;
 
-  if( tid >= NBINS_TOT ) return;
+  if( tid >= NBOXES ) return;
 
   const float w = binVol[i] / totVol;
-  s_f[tid]    = w * d_f[i] / POINTS_PER_BIN;
+  s_f[tid]    = w * d_f[i] / CALLS_PER_BOX;
 
   __syncthreads();
 
@@ -493,12 +450,13 @@ int main( int argc, char ** argv )
   printDevProp(devProp);
   */
 
-  int NBINS = ( argc > 1 ) ? atoi(argv[1]) : 8;
-  int NITER = ( argc > 2 ) ? atoi(argv[2]) : 4;
+  const int NBINS = ( argc > 1 ) ? atoi(argv[1]) : 8;
+  const int NITER = ( argc > 2 ) ? atoi(argv[2]) : 4;
+  const float ALPHA = ( argc > 3 ) ? atoi(argv[3]) : 1.5;
 
   const unsigned int NDIM = 2;
 
-  const unsigned int NBINS_TOT = pow( NBINS, NDIM );
+  const unsigned int NBOXES = pow( NBINS, NDIM );
 
   float * xmin;
   float * xmax;
@@ -516,13 +474,13 @@ int main( int argc, char ** argv )
   cudaMallocManaged( &xmax, NDIM*sizeof(float) );
   cudaMallocManaged( &d_x,        NDIM * (NBINS+1) * sizeof(float) );
   cudaMallocManaged( &d_bw,       NDIM * NBINS     * sizeof(float) );
-  CudaSafeCall( cudaMallocManaged( &d_f,        NBINS_TOT        * sizeof(float) ) );
-  cudaMallocManaged( &d_f_sq,        NBINS_TOT        * sizeof(float) );
-  cudaMallocManaged( &d_f_abs,        NBINS_TOT        * sizeof(float) );
-  cudaMallocManaged( &d_binVol,   NBINS_TOT        * sizeof(float) );
-  cudaMallocManaged( &d_sum_f,     NBINS_TOT  * sizeof(float) );
-  cudaMallocManaged( &d_sum_f_sq,  NBINS_TOT * sizeof(float) );
-  cudaMallocManaged( &d_sum_f_abs, NBINS_TOT  * sizeof(float) );
+  CudaSafeCall( cudaMallocManaged( &d_f,        NBOXES        * sizeof(float) ) );
+  cudaMallocManaged( &d_f_sq,        NBOXES        * sizeof(float) );
+  cudaMallocManaged( &d_f_abs,        NBOXES        * sizeof(float) );
+  cudaMallocManaged( &d_binVol,   NBOXES        * sizeof(float) );
+  cudaMallocManaged( &d_sum_f,     NBOXES  * sizeof(float) );
+  cudaMallocManaged( &d_sum_f_sq,  NBOXES * sizeof(float) );
+  cudaMallocManaged( &d_sum_f_abs, NBOXES  * sizeof(float) );
 
   cudaEvent_t start, stop;
   float time;
@@ -559,14 +517,17 @@ int main( int argc, char ** argv )
   cout << "INFO: CUDA: Time for setup bin edges = " << time << " ms" << endl;
   DumpEdges( d_x, NBINS, NDIM );
 
-  cout << "INFO: VEGAS will be executed on " << NBINS_TOT << " bins in total" << endl;
+  cout << "INFO: VEGAS will be executed on " << NBOXES << " bins in total" << endl;
 
   float Ibest    = 0.;
   float * Iiter = new float[NITER];
   float * Viter = new float[NITER];
   float inv_var_tot  = 0.;
   float chi2     = 0.;
-  
+
+  //const float jacobian = totVol * pow( NBINS, NDIM ) / (NBINS * CALLS_PER_BOX );
+  const float jacobian = totVol / CALLS_PER_BOX;
+
   for( int iIter = 0 ; iIter < NITER ; ++iIter ) {
     cout << "INFO: Iteration no. " << iIter << endl;
 
@@ -581,7 +542,7 @@ int main( int argc, char ** argv )
     CudaCheckError();
 
     cudaEventRecord(start, 0);  
-    CalcBinVolume<<< NBINS_TOT, 1 >>>( d_binVol, d_bw, NBINS, NDIM, NBINS_TOT );
+    CalcBinVolume<<< NBOXES, 1 >>>( d_binVol, d_bw, NBINS, NDIM, NBOXES );
     cudaDeviceSynchronize();  
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
@@ -591,7 +552,7 @@ int main( int argc, char ** argv )
     CudaCheckError();
 
     cudaEventRecord(start, 0);  
-    DoSampling<<< NBINS_TOT, THREADS_PER_BLOCK_SAMPLING >>>( d_f, d_f_sq, d_f_abs, devStates, d_x, d_bw, NBINS, NDIM, NBINS_TOT );
+    DoSampling<<< NBOXES, THREADS_PER_BLOCK_SAMPLING >>>( d_f, d_f_sq, d_f_abs, devStates, d_x, d_bw, NBINS, NDIM, NBOXES );
     cudaDeviceSynchronize();  
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
@@ -601,12 +562,12 @@ int main( int argc, char ** argv )
     //    cudaDeviceSynchronize();  
 
     // final reduction
-    //const size_t num_blocks = ( NBINS_TOT / THREADS_PER_BLOCK) + ( (NBINS_TOT % THREADS_PER_BLOCK) ? 1 : 0 );
+    //const size_t num_blocks = ( NBOXES / THREADS_PER_BLOCK) + ( (NBOXES % THREADS_PER_BLOCK) ? 1 : 0 );
 
     cudaEventRecord(start, 0);  
-    Finalize<<< 1, NBINS_TOT, NBINS_TOT*sizeof(float) >>>( d_sum_f,     d_f,     d_binVol, totVol, NBINS_TOT );
-    Finalize<<< 1, NBINS_TOT, NBINS_TOT*sizeof(float) >>>( d_sum_f_sq,  d_f_sq,  d_binVol, totVol, NBINS_TOT );
-    Finalize<<< 1, NBINS_TOT, NBINS_TOT*sizeof(float) >>>( d_sum_f_abs, d_f_abs, d_binVol, totVol, NBINS_TOT );
+    Finalize<<< 1, NBOXES, NBOXES*sizeof(float) >>>( d_sum_f,     d_f,     d_binVol, totVol, NBOXES );
+    Finalize<<< 1, NBOXES, NBOXES*sizeof(float) >>>( d_sum_f_sq,  d_f_sq,  d_binVol, totVol, NBOXES );
+    Finalize<<< 1, NBOXES, NBOXES*sizeof(float) >>>( d_sum_f_abs, d_f_abs, d_binVol, totVol, NBOXES );
     cudaDeviceSynchronize();  
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
@@ -619,7 +580,7 @@ int main( int argc, char ** argv )
     //float E = d_sum_f_sq[num_blocks];
     //float Iabs = d_sum_f_abs[0];
 
-    float var = ( E - I*I ) / ( NBINS_TOT * POINTS_PER_BIN-1);
+    float var = ( E - I*I ) / ( NBOXES * CALLS_PER_BOX-1);
     cout << "INFO: \\int{f(x)} = " <<  I << " \\pm " << sqrt(var) << endl;
   
     Iiter[iIter] = I;
@@ -630,7 +591,7 @@ int main( int argc, char ** argv )
   
     if( NITER > 1 ) {
         cudaEventRecord(start, 0);  
-	RebinGPU<<< NDIM, 1 >>>( d_x, d_f_abs, d_binVol, totVol, NBINS, NDIM, NBINS_TOT );
+	RefineGPU<<< NDIM, 1 >>>( d_x, d_f_abs, d_binVol, totVol, ALPHA, NBINS );
 	cudaDeviceSynchronize();  
 	cudaEventRecord(stop, 0);
 	cudaEventSynchronize(stop);
