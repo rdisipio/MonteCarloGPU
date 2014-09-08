@@ -11,8 +11,8 @@
 #include "CudaErrorCheck.h"
 
 #define THREADS_PER_BLOCK 256
-#define THREADS_PER_BLOCK_SAMPLING 8
-#define CALLS_PER_BOX   1024
+//#define THREADS_PER_BLOCK_SAMPLING 8
+#define CALLS_PER_BOX   128
 //( THREADS_PER_BLOCK * THREADS_PER_BLOCK )
 
 using namespace std;
@@ -20,13 +20,15 @@ using namespace std;
 __device__ __host__
 float func( const float * x )
 {
+  //return 1.;
+
   //return exp( -(x-0.5)*(x-0.5)/0.1 );  // 0.546292
   //return x[0]*x[0];
 
   //return x[0]*x[0] + x[1]*x[1]; //0.666667
-  return sin( x[0] ) * cos( x[1] ); // 0.386822
+  //return sin( x[0] ) * cos( x[1] ); // 0.386822
   // return x[0]*x[0] + sin(x[1]); // 0.793031
-  //return x[0]*x[0] + x[1]*x[1] + 2*x[2]*x[2]; //1.33333
+  return x[0]*x[0] + x[1]*x[1] + 2*x[2]*x[2]; //1.33333
 }
 
 
@@ -225,6 +227,17 @@ void DumpBinWidths( const float * bw, const int NBINS, const int NDIM )
   }
 }
 
+void DumpBoxContent( const float * bw, const int NBINS, const int NDIM )
+{
+  cout << "DEBUG: box content:" << endl;  
+  for( unsigned int d = 0 ; d < NDIM ; ++d ) {
+    for( unsigned int b = 0 ; b < NBINS ; ++b ) {
+      cout << " " << bw[d*NBINS+b];
+    }
+    cout << endl;
+  }
+}
+
 //~~~~~~~~~~~~~~~~~~~~~~
 
 
@@ -232,7 +245,8 @@ __global__
 void CalcBinVolume( float * binVol, const float * bw, const int NBINS, const int NDIM, const int NBOXES )
 {
   //const unsigned int ibin  = threadIdx.x; 
-  const unsigned int ibin  = blockIdx.x;
+  //const unsigned int ibin  = blockIdx.x;
+  const unsigned int ibin  = blockIdx.x*blockDim.x + threadIdx.x;
 
   //if( idim > NDIM ) return;
   if( ibin > NBOXES ) return;
@@ -256,47 +270,31 @@ void CalcBinVolume( float * binVol, const float * bw, const int NBINS, const int
 
 /////////////////////////////////////////////////
 
-
 __global__
-void DoSampling( 
-		  float * sum_f, float * sum_f_sq, float * sum_f_abs,
+void DoSampling( float * d_f, float * d_f_sq, float * d_f_abs,
 		  curandState * state,
 		  const float * x, const float * bw,
 		  const int NBINS, const int NDIM, const int NBOXES 
 		 )
 {
-  /*
-    N bins
-    M threads per block (1 block = 1 bin)
-    N * M threads in total
-   */
+  unsigned int iglob = blockIdx.x*blockDim.x + threadIdx.x; 
 
-  __shared__ float s_f[THREADS_PER_BLOCK];
-  __shared__ float s_f_sq[THREADS_PER_BLOCK];
-  __shared__ float s_f_abs[THREADS_PER_BLOCK];
-
-  unsigned int iglob = blockIdx.x;
-  unsigned int ibin  = blockIdx.x % NBINS;
+  unsigned int ibin  = iglob % NBINS;
   unsigned int idim  = ibin / NBINS;
-  unsigned int tid   = threadIdx.x; 
-  unsigned int I     = iglob*blockDim.x + tid;
-  
+
   if( ibin > NBINS ) return;
   if( iglob >= NBOXES ) return;
   if( idim > NDIM ) return;
 
-  curandState localState = state[I];
-  
+  curandState localState = state[iglob];
+
   float f     = 0.;
   float f_sq  = 0.;
   float f_abs = 0.;
   
-  float * x0 = new float[NDIM]; // N-dim point "x"
+  float * x0 = new float[NDIM];
 
-  // for each sampling (k) evaluate f() at a certain d-dimensional point x0
-
-  const unsigned int NSAMPLINGS = CALLS_PER_BOX/THREADS_PER_BLOCK_SAMPLING ;
-  for( unsigned int k = 0 ; k < NSAMPLINGS ; ++k ) {
+  for( unsigned int k = 0 ; k < CALLS_PER_BOX ; ++k ) {
 
     int ig = iglob;
     for( unsigned int d = 0 ; d < NDIM ; ++d ) {
@@ -317,84 +315,58 @@ void DoSampling(
   }
   delete x0;
 
-  s_f[tid]     = f;
-  s_f_sq[tid]  = f_sq;
-  s_f_abs[tid] = f_abs;
-  
-  __syncthreads();
+  d_f[iglob]     = f;
+  d_f_sq[iglob]  = f_sq;
+  d_f_abs[iglob] = f_abs;
 
-  // do reduction
-  
-  for( unsigned int s = blockDim.x/2 ; s > 0 ; s >>= 1 ) {
-    if( tid < s ) {
-      s_f[tid]     += s_f[tid+s];
-      s_f_sq[tid]  += s_f_sq[tid+s];
-      s_f_abs[tid] += s_f_abs[tid+s];
-    }
-    __syncthreads();
-  }
- 
-
-  /*
-  for( unsigned int s = blockDim.x/2 ; s > 32 ; s >>= 1 ) {
-    if( tid < s ) {
-      s_f[tid]     += s_f[tid+s];
-      s_f_sq[tid]  += s_f_sq[tid+s];
-      s_f_abs[tid] += s_f_abs[tid+s];
-    }
-    __syncthreads();
-  }
-  if( tid < 32 ) {
-    s_f[tid]     += s_f[tid + 32];
-    s_f[tid]     += s_f[tid + 16];
-    s_f[tid]     += s_f[tid +  8];
-    s_f[tid]     += s_f[tid +  4];
-    s_f[tid]     += s_f[tid +  2];
-    s_f[tid]     += s_f[tid +  1];
-
-    s_f_sq[tid]  += s_f_sq[tid + 32];
-    s_f_sq[tid]  += s_f_sq[tid + 16];
-    s_f_sq[tid]  += s_f_sq[tid +  8];
-    s_f_sq[tid]  += s_f_sq[tid +  4];
-    s_f_sq[tid]  += s_f_sq[tid +  2];
-    s_f_sq[tid]  += s_f_sq[tid +  1];
-
-    s_f_abs[tid] += s_f_abs[tid + 32];
-    s_f_abs[tid] += s_f_abs[tid + 16];
-    s_f_abs[tid] += s_f_abs[tid +  8];
-    s_f_abs[tid] += s_f_abs[tid +  4];
-    s_f_abs[tid] += s_f_abs[tid +  2];
-    s_f_abs[tid] += s_f_abs[tid +  1];
-  }
-  */
-
-  // write result to global memory
-  if( tid == 0 ) {
-    sum_f[iglob]     = s_f[0];
-    sum_f_sq[iglob]  = s_f_sq[0];
-    sum_f_abs[iglob] = s_f_abs[0];
-  }
 }
 
 
 /////////////////////////////////////////////////
 
-
-__global__ 
-void Finalize( float * sum_f, 
-	       const float * d_f, 
-	       const float * binVol, const float totVol,
-	       const unsigned int NBOXES )
+__global__
+void Accumulate( float * output, const float * input,
+		  const unsigned int NTHREADS )
 {
   extern __shared__ float s_f[];
+  
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
 
+  if( i >= NTHREADS ) return;
+  
+  s_f[i]    = input[i];
+
+  __syncthreads();
+
+  for( unsigned int s = blockDim.x/2 ; s > 0 ; s >>= 1 ) {
+    if( i < s ) {
+      s_f[i]     += s_f[i+s];
+    }
+    __syncthreads();
+  }
+
+  if( i == 0 ) {
+     output[blockIdx.x] = s_f[0];
+  }
+}
+
+
+__global__
+void ReduceBoxes( float * output, const float * input,
+		  const float * binVol, const float totVol,
+		  const unsigned int NBOXES )
+{
+  extern __shared__ float s_f[];
+  
+  unsigned int bid = blockIdx.x;
   unsigned int tid = threadIdx.x;
   unsigned int   i = blockIdx.x*blockDim.x + threadIdx.x;
 
-  if( tid >= NBOXES ) return;
-
+  if( i > NBOXES ) return;
+  if( tid > THREADS_PER_BLOCK ) return;
+  
   const float w = binVol[i] / totVol;
-  s_f[tid]    = w * d_f[i] / CALLS_PER_BOX;
+  s_f[tid]    = w * input[i] / ( CALLS_PER_BOX );
 
   __syncthreads();
 
@@ -406,9 +378,8 @@ void Finalize( float * sum_f,
   }
 
   if( tid == 0 ) {
-     sum_f[blockIdx.x] = s_f[0];
+     output[bid] = s_f[0];
   }
- 
 }
 
 
@@ -444,19 +415,20 @@ int main( int argc, char ** argv )
 {
   int success = 0;
 
-  /*
+  
   cudaDeviceProp devProp;
   cudaGetDeviceProperties( &devProp, 0 );
   printDevProp(devProp);
-  */
+  
 
   const int NBINS = ( argc > 1 ) ? atoi(argv[1]) : 8;
   const int NITER = ( argc > 2 ) ? atoi(argv[2]) : 4;
   const float ALPHA = ( argc > 3 ) ? atoi(argv[3]) : 1.5;
 
-  const unsigned int NDIM = 2;
+  const unsigned int NDIM = 3;
 
-  const unsigned int NBOXES = pow( NBINS, NDIM );
+  const unsigned int NBOXES     = pow( NBINS, NDIM );
+  const unsigned int NUM_BLOCKS = ( NBOXES / THREADS_PER_BLOCK ) + ( (NBOXES % THREADS_PER_BLOCK) ? 1 : 0 );
 
   float * xmin;
   float * xmax;
@@ -478,9 +450,9 @@ int main( int argc, char ** argv )
   cudaMallocManaged( &d_f_sq,        NBOXES        * sizeof(float) );
   cudaMallocManaged( &d_f_abs,        NBOXES        * sizeof(float) );
   cudaMallocManaged( &d_binVol,   NBOXES        * sizeof(float) );
-  cudaMallocManaged( &d_sum_f,     NBOXES  * sizeof(float) );
-  cudaMallocManaged( &d_sum_f_sq,  NBOXES * sizeof(float) );
-  cudaMallocManaged( &d_sum_f_abs, NBOXES  * sizeof(float) );
+  cudaMallocManaged( &d_sum_f,     (NUM_BLOCKS) * sizeof(float) );
+  cudaMallocManaged( &d_sum_f_sq,  (NUM_BLOCKS) * sizeof(float) );
+  cudaMallocManaged( &d_sum_f_abs, (NUM_BLOCKS) * sizeof(float) );
 
   cudaEvent_t start, stop;
   float time;
@@ -489,11 +461,11 @@ int main( int argc, char ** argv )
 
 
   // setup random generator
-  curandState *devStates;
-  cudaMallocManaged( (void **)&devStates , NDIM * THREADS_PER_BLOCK * THREADS_PER_BLOCK * sizeof(curandState) );
+  curandState *randomStates;
+  cudaMallocManaged( (void **)&randomStates , NDIM * THREADS_PER_BLOCK * THREADS_PER_BLOCK * sizeof(curandState) );
 
   cudaEventRecord(start, 0);  
-  setup_random<<< THREADS_PER_BLOCK, THREADS_PER_BLOCK >>>( devStates );
+  setup_random<<< THREADS_PER_BLOCK, THREADS_PER_BLOCK >>>( randomStates );
   cudaDeviceSynchronize();
   cudaEventRecord(stop, 0);
   cudaEventSynchronize(stop);
@@ -518,6 +490,7 @@ int main( int argc, char ** argv )
   DumpEdges( d_x, NBINS, NDIM );
 
   cout << "INFO: VEGAS will be executed on " << NBOXES << " bins in total" << endl;
+  cout << "DEBUG: number of parallel blocks in reduction step: " << NUM_BLOCKS << endl;
 
   float Ibest    = 0.;
   float * Iiter = new float[NITER];
@@ -526,7 +499,7 @@ int main( int argc, char ** argv )
   float chi2     = 0.;
 
   //const float jacobian = totVol * pow( NBINS, NDIM ) / (NBINS * CALLS_PER_BOX );
-  const float jacobian = totVol / CALLS_PER_BOX;
+  // const float jacobian = totVol / CALLS_PER_BOX;
 
   for( int iIter = 0 ; iIter < NITER ; ++iIter ) {
     cout << "INFO: Iteration no. " << iIter << endl;
@@ -541,8 +514,9 @@ int main( int argc, char ** argv )
     //DumpBinWidths( d_bw, NBINS, NDIM );
     CudaCheckError();
 
+    unsigned int bvdim = ( NBOXES / THREADS_PER_BLOCK ) + ( (NBOXES % THREADS_PER_BLOCK) ? 1 : 0 );
     cudaEventRecord(start, 0);  
-    CalcBinVolume<<< NBOXES, 1 >>>( d_binVol, d_bw, NBINS, NDIM, NBOXES );
+    CalcBinVolume<<< bvdim, THREADS_PER_BLOCK >>>( d_binVol, d_bw, NBINS, NDIM, NBOXES );
     cudaDeviceSynchronize();  
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
@@ -552,7 +526,7 @@ int main( int argc, char ** argv )
     CudaCheckError();
 
     cudaEventRecord(start, 0);  
-    DoSampling<<< NBOXES, THREADS_PER_BLOCK_SAMPLING >>>( d_f, d_f_sq, d_f_abs, devStates, d_x, d_bw, NBINS, NDIM, NBOXES );
+    DoSampling<<< NUM_BLOCKS, THREADS_PER_BLOCK >>>( d_f, d_f_sq, d_f_abs, randomStates, d_x, d_bw, NBINS, NDIM, NBOXES );
     cudaDeviceSynchronize();  
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
@@ -560,27 +534,37 @@ int main( int argc, char ** argv )
     cout << "INFO: CUDA: Time for sampling = " << time << " ms" << endl;
     CudaCheckError();
     //    cudaDeviceSynchronize();  
+    //DumpBoxContent( d_f, NBINS, NDIM );
 
-    // final reduction
-    //const size_t num_blocks = ( NBOXES / THREADS_PER_BLOCK) + ( (NBOXES % THREADS_PER_BLOCK) ? 1 : 0 );
-
+    // accumulate results - first pass
     cudaEventRecord(start, 0);  
-    Finalize<<< 1, NBOXES, NBOXES*sizeof(float) >>>( d_sum_f,     d_f,     d_binVol, totVol, NBOXES );
-    Finalize<<< 1, NBOXES, NBOXES*sizeof(float) >>>( d_sum_f_sq,  d_f_sq,  d_binVol, totVol, NBOXES );
-    Finalize<<< 1, NBOXES, NBOXES*sizeof(float) >>>( d_sum_f_abs, d_f_abs, d_binVol, totVol, NBOXES );
+    ReduceBoxes<<< NUM_BLOCKS, THREADS_PER_BLOCK, THREADS_PER_BLOCK*sizeof(float) >>>( d_sum_f,     d_f,     d_binVol, totVol, NBOXES );
+    ReduceBoxes<<< NUM_BLOCKS, THREADS_PER_BLOCK, THREADS_PER_BLOCK*sizeof(float) >>>( d_sum_f_sq,  d_f_sq,  d_binVol, totVol, NBOXES );
+    ReduceBoxes<<< NUM_BLOCKS, THREADS_PER_BLOCK, THREADS_PER_BLOCK*sizeof(float) >>>( d_sum_f_abs, d_f_abs, d_binVol, totVol, NBOXES );
     cudaDeviceSynchronize();  
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&time, start, stop);
-    cout << "INFO: CUDA: Time for final reduction = " << time << " ms" << endl;
+    cout << "INFO: CUDA: Time for accumulation (first step) = " << time << " ms" << endl;
+    CudaCheckError();
+    //DumpBoxContent( d_sum_f, NUM_BLOCKS, 1 );
+
+    // accumulate results - second pass
+    cudaEventRecord(start, 0);  
+    Accumulate<<< 1, NUM_BLOCKS, NUM_BLOCKS*sizeof(float) >>>( d_sum_f    , d_sum_f,     NUM_BLOCKS );
+    Accumulate<<< 1, NUM_BLOCKS, NUM_BLOCKS*sizeof(float) >>>( d_sum_f_sq , d_sum_f_sq,  NUM_BLOCKS );
+    Accumulate<<< 1, NUM_BLOCKS, NUM_BLOCKS*sizeof(float) >>>( d_sum_f_abs, d_sum_f_abs, NUM_BLOCKS );
+    cudaDeviceSynchronize();  
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&time, start, stop);
+    cout << "INFO: CUDA: Time for accumulation (second step) = " << time << " ms" << endl;
+    CudaCheckError();
 
     float I = d_sum_f[0];
     float E = d_sum_f_sq[0];
-    //float I = d_sum_f[num_blocks];
-    //float E = d_sum_f_sq[num_blocks];
-    //float Iabs = d_sum_f_abs[0];
-
-    float var = ( E - I*I ) / ( NBOXES * CALLS_PER_BOX-1);
+    
+    float var = ( E - I*I ) / ( NBOXES * CALLS_PER_BOX - 1 );
     cout << "INFO: \\int{f(x)} = " <<  I << " \\pm " << sqrt(var) << endl;
   
     Iiter[iIter] = I;
@@ -623,13 +607,14 @@ int main( int argc, char ** argv )
   cudaFree( d_f_sq );
   cudaFree( d_f_abs );
   cudaFree( d_binVol );
-  cudaFree( devStates );
+  cudaFree( randomStates );
   cudaFree( xmin );
   cudaFree( xmax );
   cudaFree( d_bw );
   cudaFree( d_sum_f );
   cudaFree( d_sum_f_sq );
   cudaFree( d_sum_f_abs );
+
   cout << "DEBUG: GPU memory freed" << endl;
 
   delete [] Iiter;
