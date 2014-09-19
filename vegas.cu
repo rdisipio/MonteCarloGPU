@@ -51,14 +51,14 @@ float integrand( const float * x )
   //return 1.;
 
   //return exp( -(x-0.5)*(x-0.5)/0.1 );  // 0.546292
-  return x[0]*x[0];
+  //  return x[0]*x[0];
 
-  //return x[0]*x[0] + x[1]*x[1]; //0.666667
+  return x[0]*x[0] + x[1]*x[1]; //0.666667
   //return sin( x[0] ) * cos( x[1] ); // 0.386822
 //  return x[0]*x[0] + sin(x[1]); // 0.793031
   //return x[0]*x[0] + x[1]*x[1] + 2*x[2]*x[2]; //1.33333
 }
-static const unsigned int NDIM = 1;
+static const unsigned int NDIM = 2;
 
 //DECLARE_KERNEL_FUNCTION( 1, 0, x[0]*x[0] )
 //DECLARE_KERNEL_FUNCTION( 1, 1, sin(x[0]) )
@@ -142,6 +142,24 @@ void DumpProjection( const float * f, const int NBINS, const int NDIM )
       if( (b+1) % NBINS == 0 ) cout << endl;
     }
   }
+}
+
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+__global__
+void SetBinEdges( float * xl, float * xh, const float * x, const int NBINS, const int NDIM )
+{
+  const unsigned int idim = threadIdx.x;
+  const unsigned int ibin = blockIdx.x;
+
+  if( idim > NDIM ) return;
+  if( ibin > NBINS ) return;
+
+  const unsigned int xoffset = idim * ( NBINS + 1 );
+  const unsigned int offset  = idim * NBINS;
+
+  xl[offset+ibin] = x[xoffset+ibin];
+  xh[offset+ibin] = x[xoffset+ibin+1];
 }
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -278,7 +296,6 @@ void CalcBinWidth( float * bw, const float * xl, const float * xh, const int NBI
   const int ibin  = blockIdx.x;
   const int idim  = threadIdx.x;
   const int i = idim * NBINS + ibin;
-  //const int iedge = idim * ( NBINS+1 ) + ibin;
 
   if( idim > NDIM ) return;
   if( ibin > NBINS ) return;
@@ -729,7 +746,6 @@ int main( int argc, char ** argv )
   cudaEventElapsedTime(&gputime, start, stop);
   cout << "INFO: CUDA: Time for setup bin edges = " << gputime << " ms" << endl;
   log_overhead << _SEP_ << gputime;
-  DumpEdges( d_x, NBINS, NDIM );
 
   float Ibest    = 0.;
   float * Iiter = new float[NITER];
@@ -744,6 +760,10 @@ int main( int argc, char ** argv )
     stringstream log;
 
     log << iIter << _SEP_ << log_overhead.str();
+
+    SetBinEdges<<< NBINS, NDIM >>>( d_xl, d_xh, d_x, NBINS, NDIM );
+    cudaDeviceSynchronize();  
+    DumpEdges( d_x, NBINS, NDIM );
 
     cudaEventRecord(start, 0);  
     CalcBinWidth<<< NBINS, NDIM >>>( d_bw, d_xl, d_xh, NBINS, NDIM );
@@ -851,7 +871,7 @@ int main( int argc, char ** argv )
 
         log << _SEP_ << gputime;
 	//      RebinCPU( d_x, d_box_abs, NBINS, NDIM );
-	DumpEdges( d_x, NBINS, NDIM );
+	//DumpEdges( d_x, NBINS, NDIM );
     }
     else {
       log << _SEP_ << 0.0;
